@@ -5,9 +5,13 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 from pulp import *
-from datetime import datetime
+from datetime import datetime, date
 import io
 import zipfile
+
+# --- NEW: Import your ETL function ---
+# Make sure ETL.py is in the same directory
+from ETL import etl_long_to_wide
 
 # Page configuration
 st.set_page_config(
@@ -32,6 +36,13 @@ st.info("👈 **Getting Started:** Use the sidebar to upload your data file and 
 # Sidebar for parameters
 st.sidebar.header("📁 Data Upload")
 uploaded_file = st.sidebar.file_uploader("Upload electricity price data (CSV)", type=['csv'])
+
+# --- NEW: Add a checkbox to control the ETL process ---
+transform_data = st.sidebar.checkbox(
+    "Transform data (long to wide format)", 
+    value=True, 
+    help="Check this if your data has one row per timestamp (e.g., 'Date (CET)', 'Day Ahead Price'). Uncheck if your data is already wide (date, 00:00, 00:15...)."
+)
 
 st.sidebar.header("System Parameters")
 
@@ -74,174 +85,235 @@ if hochlast_morning:
 if hochlast_evening:
     hochlast_intervals.update(range(72, 80))  # 6-8 PM
 
+# --- MAIN LOGIC CHANGE ---
 if uploaded_file is not None:
-    try:
-        # Load data
-        df = pd.read_csv(uploaded_file)
-        st.success(f"✅ Loaded {len(df)} days of data")
-        
-        # Display data preview
-        with st.expander("📊 Data Preview"):
-            st.dataframe(df.head(9))
+    df = None 
+    
+    if transform_data:
+        st.info("Uploaded file detected. Running ETL transformation...")
+        with st.spinner("Transforming data from long to wide format..."):
+            try:
+                # Call the ETL function with the uploaded file object
+                df_wide = etl_long_to_wide(
+                    input_source=uploaded_file,
+                    datetime_column_name='Date (CET)',
+                    value_column_name='Day Ahead Price'
+                )
+                st.success("✅ ETL transformation successful!")
+                df = df_wide # Use the transformed dataframe
+
+            except Exception as e:
+                # Catch the error raised from the ETL function and display it
+                st.error(f"❌ ETL process failed: {e}")
+                st.info("Please check your file format. Ensure the header row is correct and column names match the expected input.")
+                st.stop() # Stop the app from running further
+    
+    else:
+        # If the box is unchecked, load the data directly
+        try:
+            st.info("Loading data directly in wide format.")
+            df = pd.read_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"❌ Failed to load the CSV file: {e}")
+            st.stop()
+
+    # From here, the app continues only if 'df' is a valid DataFrame
+    if df is not None:
+        try:
+            # --- NEW: DATE RANGE SELECTION WIDGETS ---
+            st.sidebar.header("🗓️ Date Range Filter")
             
-            # Show data statistics
-            col1, col2, col3 = st.columns(3)
+            # Ensure the 'date' column is in datetime format for min/max operations
+            df['date_obj'] = pd.to_datetime(df['date'])
+            
+            min_date = df['date_obj'].min().date()
+            max_date = df['date_obj'].max().date()
+
+            # Create two columns for side-by-side date pickers
+            col1, col2 = st.sidebar.columns(2)
             with col1:
-                st.metric("Total Days", len(df))
+                start_date = st.date_input("Start Date", value=min_date, min_value=min_date, max_value=max_date)
             with col2:
-                time_cols = [col for col in df.columns if col != 'date']
-                st.metric("Time Intervals/Day", len(time_cols))
-            with col3:
-                if len(time_cols) > 0:
-                    avg_price = df[time_cols].mean().mean()
-                    st.metric("Avg Price (€/MWh)", f"{avg_price:.2f}")
-        
-        # Data cleaning
-        st.header("Data Cleaning")
-        with st.spinner("Cleaning data..."):
-            for col in df.columns:
-                if col != 'date':
-                    df[col] = df[col].replace([np.inf, -np.inf], np.nan)
-                    df[col] = df[col].interpolate(method='linear', limit_direction='both')
-                    if df[col].isna().any():
-                        col_median = df[col].median()
-                        df[col] = df[col].fillna(col_median)
-        
-        st.success("✅ Data cleaning completed")
-        
-        # Get time columns
-        time_cols = [col for col in df.columns if col != 'date']
-        
-        # Functions for optimization
-        def build_thermal_model(prices, soc0, is_holiday=False):
-            """Build optimization model for thermal storage system"""
-            T = len(prices)
-            model = LpProblem("Thermal_Storage", LpMinimize)
+                end_date = st.date_input("End Date", value=max_date, min_value=min_date, max_value=max_date)
+
+            # Validate the date range
+            if start_date > end_date:
+                st.sidebar.error("Error: Start date cannot be after end date.")
+                st.stop()
+
+            # Filter the dataframe based on the selected date range
+            mask = (df['date_obj'] >= pd.to_datetime(start_date)) & (df['date_obj'] <= pd.to_datetime(end_date))
+            df_filtered = df.loc[mask].drop(columns=['date_obj'])  # Drop the temporary datetime column
+
+            st.success(f"✅ Loaded {len(df_filtered)} days of data within the selected range ({start_date} to {end_date})")
             
-            # Decision variables
-            p_el = LpVariable.dicts("p_el", range(T), lowBound=0, upBound=Pmax_el)
-            p_th = LpVariable.dicts("p_th", range(T), lowBound=0, upBound=Pmax_th)
-            p_gas = LpVariable.dicts("p_gas", range(T), lowBound=0)
-            soc = LpVariable.dicts("soc", range(T), lowBound=SOC_min, upBound=Smax)
+            # Display data preview
+            with st.expander("📊 Data Preview (filtered)"):
+                st.dataframe(df_filtered.head(9))
+                
+                # Show data statistics
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Days", len(df_filtered))
+                with col2:
+                    time_cols = [col for col in df_filtered.columns if col != 'date']
+                    st.metric("Time Intervals/Day", len(time_cols))
+                with col3:
+                    if len(time_cols) > 0:
+                        avg_price = df_filtered[time_cols].mean().mean()
+                        st.metric("Avg Price (€/MWh)", f"{avg_price:.2f}")
             
-            # Objective: minimize total cost
-            model += lpSum([
-                (prices[t] + C_grid) * p_el[t] * Δt +
-                C_gas * p_gas[t] * Δt
-                for t in range(T)
-            ]) - terminal_value * soc[T-1]
+            # Data cleaning
+            st.header("Data Cleaning")
+            with st.spinner("Cleaning data..."):
+                for col in df_filtered.columns:
+                    if col != 'date':
+                        df_filtered[col] = df_filtered[col].replace([np.inf, -np.inf], np.nan)
+                        df_filtered[col] = df_filtered[col].interpolate(method='linear', limit_direction='both')
+                        if df_filtered[col].isna().any():
+                            col_median = df_filtered[col].median()
+                            df_filtered[col] = df_filtered[col].fillna(col_median)
             
-            for t in range(T):
-                # Thermal balance
-                model += p_th[t] + p_gas[t] == D_th
-                
-                # Hochlast constraint
-                if t in hochlast_intervals and not is_holiday:
-                    model += p_el[t] == 0
-                
-                # Storage dynamics
-                if t == 0:
-                    model += soc[t] == soc0 + η * p_el[t] * Δt - p_th[t] * Δt
-                else:
-                    model += soc[t] == soc[t-1] + η * p_el[t] * Δt - p_th[t] * Δt
+            st.success("✅ Data cleaning completed")
             
-            return model, p_el, p_th, p_gas, soc
-        
-        # Run optimization
-        if st.button("🚀 Run Optimization", type="primary"):
-            # Clear previous results
-            if 'results' in st.session_state:
-                del st.session_state['results']
-            if 'all_trades' in st.session_state:
-                del st.session_state['all_trades']
-            if 'gas_baseline' in st.session_state:
-                del st.session_state['gas_baseline']
+            # Get time columns
+            time_cols = [col for col in df_filtered.columns if col != 'date']
             
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            soc0 = SOC_min
-            results = []
-            all_trades = []
-            gas_baseline = D_th * 24 * C_gas
-            
-            # Process each day
-            for idx, (_, row) in enumerate(df.iterrows()):
-                progress_bar.progress((idx + 1) / len(df))
-                status_text.text(f"Processing day {idx + 1}/{len(df)}: {row['date']}")
+            # Functions for optimization
+            def build_thermal_model(prices, soc0, is_holiday=False):
+                """Build optimization model for thermal storage system"""
+                T = len(prices)
+                model = LpProblem("Thermal_Storage", LpMinimize)
                 
-                day = row['date']
-                prices = row[time_cols].values
+                # Decision variables
+                p_el = LpVariable.dicts("p_el", range(T), lowBound=0, upBound=Pmax_el)
+                p_th = LpVariable.dicts("p_th", range(T), lowBound=0, upBound=Pmax_th)
+                p_gas = LpVariable.dicts("p_gas", range(T), lowBound=0)
+                soc = LpVariable.dicts("soc", range(T), lowBound=SOC_min, upBound=Smax)
                 
-                if len(prices) != 96:
-                    continue
+                # Objective: minimize total cost
+                model += lpSum([
+                    (prices[t] + C_grid) * p_el[t] * Δt +
+                    C_gas * p_gas[t] * Δt
+                    for t in range(T)
+                ]) - terminal_value * soc[T-1]
                 
-                is_holiday = day in holiday_set
-                
-                # Build and solve model
-                model, p_el, p_th, p_gas, soc = build_thermal_model(prices, soc0, is_holiday)
-                status = model.solve(PULP_CBC_CMD(msg=False))
-                
-                if status == 1:  # successful optimization
-                    actual_elec_cost = sum((prices[t] + C_grid) * p_el[t].value() * Δt for t in range(96))
-                    actual_gas_cost = sum(C_gas * p_gas[t].value() * Δt for t in range(96))
-                    soc_end = soc[95].value()
+                for t in range(T):
+                    # Thermal balance
+                    model += p_th[t] + p_gas[t] == D_th
                     
-                    actual_total_cost = actual_elec_cost + actual_gas_cost - terminal_value * soc_end
-                    savings = gas_baseline - actual_total_cost
+                    # Hochlast constraint
+                    if t in hochlast_intervals and not is_holiday:
+                        model += p_el[t] == 0
                     
-                    elec_energy = sum([p_el[t].value() * Δt for t in range(96)])
-                    gas_energy = sum([p_gas[t].value() * Δt for t in range(96)])
+                    # Storage dynamics
+                    if t == 0:
+                        model += soc[t] == soc0 + η * p_el[t] * Δt - p_th[t] * Δt
+                    else:
+                        model += soc[t] == soc[t-1] + η * p_el[t] * Δt - p_th[t] * Δt
+                
+                return model, p_el, p_th, p_gas, soc
+            
+            # Run optimization
+            if st.button("🚀 Run Optimization", type="primary"):
+                # Clear previous results
+                if 'results' in st.session_state:
+                    del st.session_state['results']
+                if 'all_trades' in st.session_state:
+                    del st.session_state['all_trades']
+                if 'gas_baseline' in st.session_state:
+                    del st.session_state['gas_baseline']
+                
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                soc0 = SOC_min
+                results = []
+                all_trades = []
+                gas_baseline = D_th * 24 * C_gas
+                
+                # Process each day in the filtered dataframe
+                for idx, (_, row) in enumerate(df_filtered.iterrows()):
+                    progress_bar.progress((idx + 1) / len(df_filtered))
+                    status_text.text(f"Processing day {idx + 1}/{len(df_filtered)}: {row['date']}")
                     
-                    # Store detailed trading data
-                    for t in range(96):
-                        interval_hour = t // 4
-                        interval_min = (t % 4) * 15
-                        time_str = f"{interval_hour:02d}:{interval_min:02d}:00"
+                    day = row['date']
+                    prices = row[time_cols].values
+                    
+                    if len(prices) != 96:
+                        continue
+                    
+                    is_holiday = day in holiday_set
+                    
+                    # Build and solve model
+                    model, p_el, p_th, p_gas, soc = build_thermal_model(prices, soc0, is_holiday)
+                    status = model.solve(PULP_CBC_CMD(msg=False))
+                    
+                    if status == 1:  # successful optimization
+                        actual_elec_cost = sum((prices[t] + C_grid) * p_el[t].value() * Δt for t in range(96))
+                        actual_gas_cost = sum(C_gas * p_gas[t].value() * Δt for t in range(96))
+                        soc_end = soc[95].value()
                         
-                        trade_record = {
-                            'date': day,
-                            'time': time_str,
-                            'interval': t,
-                            'da_price': prices[t],
-                            'total_elec_cost': prices[t] + C_grid,
-                            'p_el_heater': p_el[t].value(),
-                            'p_th_discharge': p_th[t].value(),
-                            'p_gas_backup': p_gas[t].value(),
-                            'soc': soc[t].value(),
-                            'elec_cost_interval': (prices[t] + C_grid) * p_el[t].value() * Δt,
-                            'gas_cost_interval': C_gas * p_gas[t].value() * Δt,
-                            'total_cost_interval': (prices[t] + C_grid) * p_el[t].value() * Δt + C_gas * p_gas[t].value() * Δt,
-                            'is_hochlast': t in hochlast_intervals and not is_holiday,
-                            'is_holiday': is_holiday,
-                            'is_charging': p_el[t].value() > 0.01,
-                            'is_discharging': p_th[t].value() > 0.01,
-                            'using_gas': p_gas[t].value() > 0.01
-                        }
-                        all_trades.append(trade_record)
-                    
-                    # Update SOC for next day
-                    soc0 = soc_end
-                    
-                    # Store daily results
-                    results.append({
-                        "day": day,
-                        "cost": actual_total_cost,
-                        "savings": savings,
-                        "soc_end": soc_end,
-                        "elec_energy": elec_energy,
-                        "gas_energy": gas_energy,
-                        "is_holiday": is_holiday
-                    })
-            
-            progress_bar.progress(1.0)
-            status_text.text("✅ Optimization completed!")
-            
-            # Store results in session state
-            st.session_state['results'] = results
-            st.session_state['all_trades'] = all_trades
-            st.session_state['gas_baseline'] = gas_baseline
-        
+                        actual_total_cost = actual_elec_cost + actual_gas_cost - terminal_value * soc_end
+                        savings = gas_baseline - actual_total_cost
+                        
+                        elec_energy = sum([p_el[t].value() * Δt for t in range(96)])
+                        gas_energy = sum([p_gas[t].value() * Δt for t in range(96)])
+                        
+                        # Store detailed trading data
+                        for t in range(96):
+                            interval_hour = t // 4
+                            interval_min = (t % 4) * 15
+                            time_str = f"{interval_hour:02d}:{interval_min:02d}:00"
+                            
+                            trade_record = {
+                                'date': day,
+                                'time': time_str,
+                                'interval': t,
+                                'da_price': prices[t],
+                                'total_elec_cost': prices[t] + C_grid,
+                                'p_el_heater': p_el[t].value(),
+                                'p_th_discharge': p_th[t].value(),
+                                'p_gas_backup': p_gas[t].value(),
+                                'soc': soc[t].value(),
+                                'elec_cost_interval': (prices[t] + C_grid) * p_el[t].value() * Δt,
+                                'gas_cost_interval': C_gas * p_gas[t].value() * Δt,
+                                'total_cost_interval': (prices[t] + C_grid) * p_el[t].value() * Δt + C_gas * p_gas[t].value() * Δt,
+                                'is_hochlast': t in hochlast_intervals and not is_holiday,
+                                'is_holiday': is_holiday,
+                                'is_charging': p_el[t].value() > 0.01,
+                                'is_discharging': p_th[t].value() > 0.01,
+                                'using_gas': p_gas[t].value() > 0.01
+                            }
+                            all_trades.append(trade_record)
+                        
+                        # Update SOC for next day
+                        soc0 = soc_end
+                        
+                        # Store daily results
+                        results.append({
+                            "day": day,
+                            "cost": actual_total_cost,
+                            "savings": savings,
+                            "soc_end": soc_end,
+                            "elec_energy": elec_energy,
+                            "gas_energy": gas_energy,
+                            "is_holiday": is_holiday
+                        })
+                
+                progress_bar.progress(1.0)
+                status_text.text("✅ Optimization completed!")
+                
+                # Store results in session state
+                st.session_state['results'] = results
+                st.session_state['all_trades'] = all_trades
+                st.session_state['gas_baseline'] = gas_baseline
+                
+        except Exception as e:
+            st.error(f"❌ An error occurred after loading the data: {str(e)}")
+            st.info("Please ensure your CSV file is in the expected format.")
+            st.stop()
+
         # Display results (check session state first)
         if 'results' in st.session_state and st.session_state['results']:
             results = st.session_state['results']
@@ -452,27 +524,42 @@ Results Summary:
         else:
             # Show message when no results are available
             st.info("🔍 Run optimization to see results and download options.")
-                
-    except Exception as e:
-        st.error(f"❌ Error processing file: {str(e)}")
-        st.info("Please ensure your CSV file has a 'date' column and 96 price columns for each day.")
 
 else:
     st.info("👈 Please upload a CSV file using the sidebar to begin.")
     
-    # Show sample data format
-    with st.expander("📋 Expected Data Format"):
+    # --- NEW: Update the data format instructions ---
+    with st.expander("📋 Expected Data Format Guide"):
         st.markdown("""
-        Your CSV file should contain:
-        - A 'date' column with dates in YYYY-MM-DD format
-        - 96 columns with electricity prices (one for each 15-minute interval)
-        - Column names can be anything except 'date'
+        This app can handle two data formats. Select the correct option in the sidebar.
         
-        Example structure:
+        ---
+        
+        #### 1. Long Format (when "Transform data" is checked)
+        This is the preferred format for upload. The ETL process will convert it automatically.
+        - A column with datetime information (e.g., `Date (CET)`).
+        - A column with the price/value you want to use (e.g., `Day Ahead Price`).
+        - Each row represents a single time step.
+        
+        **Example (`idprices-epexshort.csv`):**
         ```
-        date,00:00,00:15,00:30,...,23:45
-        2024-01-01,45.2,43.1,41.5,...,52.3
-        2024-01-02,38.7,36.2,34.8,...,48.9
+        Date (CET),Day Ahead Price,...
+        [01/01/2024 00:00],0.10,...
+        [01/01/2024 00:15],0.10,...
+        ```
+        
+        ---
+        
+        #### 2. Wide Format (when "Transform data" is unchecked)
+        If your data is already processed into this format.
+        - A 'date' column with dates in YYYY-MM-DD format.
+        - 96 columns with electricity prices for each 15-minute interval (e.g., `00:00:00`, `00:15:00`, etc.).
+        
+        **Example:**
+        ```
+        date,00:00:00,00:15:00,...,23:45:00
+        2024-01-01,45.2,43.1,...,52.3
+        2024-01-02,38.7,36.2,...,48.9
         ```
         """)
 
