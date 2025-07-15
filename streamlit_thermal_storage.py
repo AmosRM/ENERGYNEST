@@ -344,11 +344,11 @@ if uploaded_file is not None:
             with col1:
                 st.metric("Days Analyzed", len(results))
             with col2:
-                st.metric("Average Daily Savings", f"€{avg_savings:.2f}", f"{savings_pct:.1f}%")
+                st.metric("Average Daily Savings", f"€{avg_savings:.0f}", f"{savings_pct:.1f}%")
             with col3:
-                st.metric("Total Savings", f"€{total_savings:.2f}")
+                st.metric("Total Savings", f"€{total_savings:.0f}")
             with col4:
-                st.metric("Gas Baseline", f"€{gas_baseline:.2f}/day")
+                st.metric("Gas Baseline", f"€{gas_baseline:.0f}/day")
             
             # Energy mix
             thermal_from_elec = avg_elec * η
@@ -415,16 +415,19 @@ if uploaded_file is not None:
                             rows=3, cols=1,
                             subplot_titles=('Electricity Price & Storage Operations', 
                                           'State of Charge', 'Cost Breakdown'),
-                            vertical_spacing=0.1
+                            vertical_spacing=0.1,
+                            specs=[[{"secondary_y": True}],
+                                    [{"secondary_y": False}],
+                                    [{"secondary_y": False}]]
                         )
                         
                         # Price and operations
                         fig4.add_trace(go.Scatter(x=day_trades['time'], y=day_trades['da_price'],
-                                                name='DA Price', line=dict(color='blue')), row=1, col=1)
+                                                name='DA Price', line=dict(color='blue')), row=1, col=1, secondary_y=False)
                         fig4.add_trace(go.Scatter(x=day_trades['time'], y=day_trades['p_el_heater'],
-                                                name='Charging', line=dict(color='green')), row=1, col=1)
+                                                name='Charging', line=dict(color='green', dash='dot')), row=1, col=1, secondary_y=True)
                         fig4.add_trace(go.Scatter(x=day_trades['time'], y=day_trades['p_th_discharge'],
-                                                name='Discharging', line=dict(color='red')), row=1, col=1)
+                                                name='Discharging', line=dict(color='red', dash='dot')), row=1, col=1, secondary_y=True)
                         
                         # SOC
                         fig4.add_trace(go.Scatter(x=day_trades['time'], y=day_trades['soc'],
@@ -441,6 +444,10 @@ if uploaded_file is not None:
                             height=800, 
                             title_text=f"Detailed Analysis for {sample_day}"
                         )
+                        fig4.update_yaxes(title_text="Price (€/MWh)", row=1, col=1, secondary_y=False)
+                        fig4.update_yaxes(title_text="Power (MW)", row=1, col=1, secondary_y=True, showgrid=False)
+                        fig4.update_yaxes(title_text="Storage (MWh)", row=2, col=1)
+                        fig4.update_yaxes(title_text="Cost (€)", row=3, col=1)
                         
                         # Format x-axis to show time labels nicely - show only every 4th interval (hourly)
                         hourly_times = day_trades[day_trades['interval'] % 4 == 0]['time'].tolist()
