@@ -456,7 +456,6 @@ if uploaded_file is not None:
                                                 name='Charging', line=dict(color='green', dash='dot')), row=1, col=1, secondary_y=True)
                         fig4.add_trace(go.Scatter(x=day_trades['time'], y=day_trades['p_th_discharge'],
                                                 name='Discharging', line=dict(color='red', dash='dot')), row=1, col=1, secondary_y=True)
-
                         # SOC
                         fig4.add_trace(go.Scatter(x=day_trades['time'], y=day_trades['soc'],
                                                 name='SOC', line=dict(color='orange')), row=2, col=1)
@@ -476,7 +475,6 @@ if uploaded_file is not None:
                         fig4.update_yaxes(title_text="Power (MW)", row=1, col=1, secondary_y=True, showgrid=False)
                         fig4.update_yaxes(title_text="Storage (MWh)", row=2, col=1)
                         fig4.update_yaxes(title_text="Cost (€)", row=3, col=1)
-
                         # Format x-axis to show time labels nicely - show only every 4th interval (hourly)
                         hourly_times = day_trades[day_trades['interval'] % 4 == 0]['time'].tolist()
                         fig4.update_xaxes(
